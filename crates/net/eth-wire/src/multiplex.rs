@@ -24,7 +24,7 @@ use crate::{
     UnifiedStatus,
 };
 use bytes::{Bytes, BytesMut};
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
@@ -166,6 +166,24 @@ impl<St> RlpxProtocolMultiplexer<St> {
         // this polls the connection and the primary stream concurrently until the handshake is
         // complete
         loop {
+            // Poll all subprotocols for new messages before entering tokio::select!
+            if !self.inner.protocols.is_empty() {
+                let mut protocols = std::mem::take(&mut self.inner.protocols);
+                for mut proto in protocols.drain(..) {
+                    if let Some(Ok(msg)) = futures::StreamExt::next(&mut proto).now_or_never().flatten() {
+                        self.inner.out_buffer.push_back(msg);
+                    }
+                    self.inner.protocols.push(proto);
+                }
+            }
+
+            // Process any buffered messages from subprotocols
+            while let Some(msg) = self.inner.out_buffer.pop_front() {
+                if let Err(err) = self.inner.conn.send(msg).await {
+                    return Err(err.into());
+                }
+            }
+
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
                     // Ensure the message belongs to the primary protocol
