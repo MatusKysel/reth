@@ -154,6 +154,7 @@ impl<St> RlpxProtocolMultiplexer<St> {
 
         let (to_primary, from_wire) = mpsc::unbounded_channel();
         let (to_wire, mut from_primary) = mpsc::unbounded_channel();
+        let (subprotocol_tx, mut subprotocol_rx) = mpsc::unbounded_channel::<Bytes>();
         let proxy = ProtocolProxy {
             shared_cap: shared_cap.clone(),
             from_wire: UnboundedReceiverStream::new(from_wire),
@@ -166,12 +167,12 @@ impl<St> RlpxProtocolMultiplexer<St> {
         // this polls the connection and the primary stream concurrently until the handshake is
         // complete
         loop {
-            // Poll all subprotocols for new messages before entering tokio::select!
+            // Poll subprotocols outside of select to avoid borrow checker issues
             if !self.inner.protocols.is_empty() {
                 let mut protocols = std::mem::take(&mut self.inner.protocols);
                 for mut proto in protocols.drain(..) {
                     if let Some(Ok(msg)) = futures::StreamExt::next(&mut proto).now_or_never().flatten() {
-                        self.inner.out_buffer.push_back(msg);
+                        let _ = subprotocol_tx.send(msg);
                     }
                     self.inner.protocols.push(proto);
                 }
@@ -199,7 +200,8 @@ impl<St> RlpxProtocolMultiplexer<St> {
                 Some(msg) = from_primary.recv() => {
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
-                Some(msg) = async { self.inner.out_buffer.pop_front() }, if !self.inner.out_buffer.is_empty() => {
+                // Process messages from subprotocols
+                Some(msg) = subprotocol_rx.recv() => {
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
                 res = &mut f => {
