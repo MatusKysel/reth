@@ -167,16 +167,23 @@ impl<St> RlpxProtocolMultiplexer<St> {
         // this polls the connection and the primary stream concurrently until the handshake is
         // complete
         loop {
-            // Poll subprotocols outside of select to avoid borrow checker issues
-            if !self.inner.protocols.is_empty() {
-                let mut protocols = std::mem::take(&mut self.inner.protocols);
-                for mut proto in protocols.drain(..) {
-                    if let Some(Ok(msg)) = futures::StreamExt::next(&mut proto).now_or_never().flatten() {
-                        let _ = subprotocol_tx.send(msg);
+            // Helper to poll subprotocols once and enqueue ready messages
+            let poll_subprotocols_once = |mux: &mut RlpxProtocolMultiplexer<St>| {
+                if !mux.inner.protocols.is_empty() {
+                    let mut protocols = std::mem::take(&mut mux.inner.protocols);
+                    for mut proto in protocols.drain(..) {
+                        while let Some(Ok(msg)) =
+                            futures::StreamExt::next(&mut proto).now_or_never().flatten()
+                        {
+                            let _ = subprotocol_tx.send(msg);
+                        }
+                        mux.inner.protocols.push(proto);
                     }
-                    self.inner.protocols.push(proto);
                 }
-            }
+            };
+
+            // Poll subprotocols outside of select to avoid borrow checker issues
+            poll_subprotocols_once(&mut self);
 
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
@@ -192,6 +199,8 @@ impl<St> RlpxProtocolMultiplexer<St> {
                             } else {
                                 // delegate to satellite
                                 self.inner.delegate_message(&cap, msg);
+                                // After delegating, poll subprotocols once to pick up immediate responses
+                                poll_subprotocols_once(&mut self);
                             }
                         } else {
                            return Err(P2PStreamError::UnknownReservedMessageId(offset).into())
