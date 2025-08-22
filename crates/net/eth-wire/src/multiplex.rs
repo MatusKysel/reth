@@ -181,8 +181,6 @@ impl<St> RlpxProtocolMultiplexer<St> {
             }
         };
 
-        // Poll subprotocols outside of select to avoid borrow checker issues
-        poll_subprotocols_once(&mut self);
         loop {
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
