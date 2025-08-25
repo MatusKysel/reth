@@ -697,7 +697,6 @@ impl<'a> std::future::Future for ProtocolsPoller<'a> {
                     }
                     Poll::Ready(Some(Ok(msg))) => {
                         // Got a message, put protocol back and return the message
-                        self.protocols.push(proto);
                         return Poll::Ready(Some(msg));
                     }
                     Poll::Ready(None) => {
