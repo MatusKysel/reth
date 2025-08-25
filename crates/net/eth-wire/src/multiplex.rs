@@ -675,14 +675,12 @@ impl fmt::Debug for ProtocolStream {
 /// Helper to poll multiple protocol streams in a tokio::select! branch
 struct ProtocolsPoller<'a> {
     protocols: &'a mut Vec<ProtocolStream>,
-    current_idx: usize,
 }
 
 impl<'a> ProtocolsPoller<'a> {
     fn new(protocols: &'a mut Vec<ProtocolStream>) -> Self {
         Self {
             protocols,
-            current_idx: 0,
         }
     }
 }
@@ -691,31 +689,37 @@ impl<'a> std::future::Future for ProtocolsPoller<'a> {
     type Output = Option<Bytes>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            if self.current_idx >= self.protocols.len() {
-                self.current_idx = 0;
-                return Poll::Pending;
-            }
-
-            let current_idx = self.current_idx;
-            let proto = &mut self.protocols[current_idx];
-            match proto.satellite_st.as_mut().poll_next(cx) {
-                Poll::Ready(Some(msg)) => {
-                    if let Ok(masked_msg) = proto.mask_msg_id(msg) {
-                        return Poll::Ready(Some(masked_msg));
+        // Process protocols in reverse order, like the existing pattern
+        for idx in (0..self.protocols.len()).rev() {
+            let mut proto = self.protocols.swap_remove(idx);
+            
+            // Drain this protocol completely
+            loop {
+                match proto.poll_next_unpin(cx) {
+                    Poll::Ready(Some(Err(_err))) => {
+                        // Protocol error, drop this protocol
+                        break;
                     }
-                    // Continue polling this protocol if masking failed
-                }
-                Poll::Ready(None) => {
-                    // Protocol ended, remove it
-                    self.protocols.remove(current_idx);
-                    // Don't increment current_idx since we removed an element
-                }
-                Poll::Pending => {
-                    self.current_idx += 1;
+                    Poll::Ready(Some(Ok(msg))) => {
+                        // Got a message, put protocol back and return the message
+                        self.protocols.push(proto);
+                        return Poll::Ready(Some(msg));
+                    }
+                    Poll::Ready(None) => {
+                        // Protocol ended, don't put it back
+                        break;
+                    }
+                    Poll::Pending => {
+                        // No more ready messages, put protocol back
+                        self.protocols.push(proto);
+                        break;
+                    }
                 }
             }
         }
+        
+        // All protocols processed, nothing ready
+        Poll::Pending
     }
 }
 
