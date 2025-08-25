@@ -163,26 +163,6 @@ impl<St> RlpxProtocolMultiplexer<St> {
         let f = handshake(proxy);
         let mut f = pin!(f);
 
-        for idx in (0..self.inner.protocols.len()).rev() {
-            let mut proto = self.inner.protocols.swap_remove(idx);
-            loop {
-                match proto.satellite_st.as_mut().poll_next(&mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
-                    Poll::Ready(Some(msg)) => {
-                        if let Ok(masked_msg) = proto.mask_msg_id(msg) {
-                            self.inner.out_buffer.push_back(masked_msg);
-                        } else {
-                            break;
-                        }
-                    }
-                    Poll::Ready(None) => break,
-                    Poll::Pending => {
-                        self.inner.protocols.push(proto);
-                        break;
-                    }
-                }
-            }
-        }
-
         loop {
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
@@ -217,6 +197,33 @@ impl<St> RlpxProtocolMultiplexer<St> {
                                 shared_cap,
                             }
                     }, extra))
+                }
+                // Poll existing protocols non-blockingly
+                _ = futures::future::ready(()) => {
+                    // Poll all existing protocol streams for outgoing messages
+                    for idx in (0..self.inner.protocols.len()).rev() {
+                        let mut proto = self.inner.protocols.swap_remove(idx);
+                        match proto.satellite_st.as_mut().poll_next(&mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
+                            Poll::Ready(Some(msg)) => {
+                                if let Ok(masked_msg) = proto.mask_msg_id(msg) {
+                                    self.inner.out_buffer.push_back(masked_msg);
+                                }
+                                self.inner.protocols.push(proto);
+                            }
+                            Poll::Ready(None) => {
+                                // Protocol stream ended, don't put it back
+                            }
+                            Poll::Pending => {
+                                self.inner.protocols.push(proto);
+                            }
+                        }
+                    }
+                    // Send any queued outgoing messages
+                    while let Some(msg) = self.inner.out_buffer.pop_front() {
+                        if self.inner.conn.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
