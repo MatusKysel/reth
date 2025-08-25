@@ -24,7 +24,7 @@ use crate::{
     UnifiedStatus,
 };
 use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
@@ -149,12 +149,11 @@ impl<St> RlpxProtocolMultiplexer<St> {
     {
         let Ok(shared_cap) = self.shared_capabilities().ensure_matching_capability(cap).cloned()
         else {
-            return Err(P2PStreamError::CapabilityNotShared.into())
+            return Err(P2PStreamError::CapabilityNotShared.into());
         };
 
         let (to_primary, from_wire) = mpsc::unbounded_channel();
         let (to_wire, mut from_primary) = mpsc::unbounded_channel();
-        let (subprotocol_tx, mut subprotocol_rx) = mpsc::unbounded_channel::<Bytes>();
         let proxy = ProtocolProxy {
             shared_cap: shared_cap.clone(),
             from_wire: UnboundedReceiverStream::new(from_wire),
@@ -164,22 +163,25 @@ impl<St> RlpxProtocolMultiplexer<St> {
         let f = handshake(proxy);
         let mut f = pin!(f);
 
-        // this polls the connection and the primary stream concurrently until the handshake is
-        // complete
-        // Helper to poll subprotocols once and enqueue ready messages
-        let poll_subprotocols_once = |mux: &mut RlpxProtocolMultiplexer<St>| {
-            if !mux.inner.protocols.is_empty() {
-                let mut protocols = std::mem::take(&mut mux.inner.protocols);
-                for mut proto in protocols.drain(..) {
-                    while let Some(Ok(msg)) =
-                        futures::StreamExt::next(&mut proto).now_or_never().flatten()
-                    {
-                        let _ = subprotocol_tx.send(msg);
+        for idx in (0..self.inner.protocols.len()).rev() {
+            let mut proto = self.inner.protocols.swap_remove(idx);
+            loop {
+                match proto.satellite_st.as_mut().poll_next(&mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
+                    Poll::Ready(Some(msg)) => {
+                        if let Ok(masked_msg) = proto.mask_msg_id(msg) {
+                            self.inner.out_buffer.push_back(masked_msg);
+                        } else {
+                            break;
+                        }
                     }
-                    mux.inner.protocols.push(proto);
+                    Poll::Ready(None) => break,
+                    Poll::Pending => {
+                        self.inner.protocols.push(proto);
+                        break;
+                    }
                 }
             }
-        };
+        }
 
         loop {
             tokio::select! {
@@ -196,18 +198,12 @@ impl<St> RlpxProtocolMultiplexer<St> {
                             } else {
                                 // delegate to satellite
                                 self.inner.delegate_message(&cap, msg);
-                                // After delegating, poll subprotocols once to pick up immediate responses
-                                poll_subprotocols_once(&mut self);
                             }
                         } else {
                            return Err(P2PStreamError::UnknownReservedMessageId(offset).into())
                         }
                 }
                 Some(msg) = from_primary.recv() => {
-                    self.inner.conn.send(msg).await.map_err(Into::into)?;
-                }
-                // Process messages from subprotocols
-                Some(msg) = subprotocol_rx.recv() => {
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
                 res = &mut f => {
