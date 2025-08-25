@@ -192,9 +192,6 @@ impl<St> RlpxProtocolMultiplexer<St> {
                 Some(msg) = from_primary.recv() => {
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
-                Some(msg) = async { self.inner.out_buffer.pop_front() }, if !self.inner.out_buffer.is_empty() => {
-                    self.inner.conn.send(msg).await.map_err(Into::into)?;
-                }
                 res = &mut f => {
                     let (st, extra) = res?;
                     return Ok((RlpxSatelliteStream {
@@ -679,9 +676,7 @@ struct ProtocolsPoller<'a> {
 
 impl<'a> ProtocolsPoller<'a> {
     fn new(protocols: &'a mut Vec<ProtocolStream>) -> Self {
-        Self {
-            protocols,
-        }
+        Self { protocols }
     }
 }
 
@@ -692,7 +687,7 @@ impl<'a> std::future::Future for ProtocolsPoller<'a> {
         // Process protocols in reverse order, like the existing pattern
         for idx in (0..self.protocols.len()).rev() {
             let mut proto = self.protocols.swap_remove(idx);
-            
+
             // Drain this protocol completely
             loop {
                 match proto.poll_next_unpin(cx) {
@@ -717,7 +712,7 @@ impl<'a> std::future::Future for ProtocolsPoller<'a> {
                 }
             }
         }
-        
+
         // All protocols processed, nothing ready
         Poll::Pending
     }
