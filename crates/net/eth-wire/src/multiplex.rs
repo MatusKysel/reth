@@ -175,13 +175,6 @@ impl<St> RlpxProtocolMultiplexer<St> {
             }
         }
 
-        // // Process any buffered messages from subprotocols
-        // while let Some(msg) = self.inner.out_buffer.pop_front() {
-        //     if let Err(err) = self.inner.conn.send(msg).await {
-        //         break;
-        //     }
-        // }
-
         loop {
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
@@ -203,6 +196,9 @@ impl<St> RlpxProtocolMultiplexer<St> {
                         }
                 }
                 Some(msg) = from_primary.recv() => {
+                    self.inner.conn.send(msg).await.map_err(Into::into)?;
+                }
+                Some(msg) = async { self.inner.out_buffer.pop_front() }, if !self.inner.out_buffer.is_empty() => {
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
                 res = &mut f => {
