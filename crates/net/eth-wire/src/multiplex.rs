@@ -465,11 +465,6 @@ where
         let this = self.get_mut();
 
         loop {
-            // first drain the primary stream
-            if let Poll::Ready(Some(msg)) = this.primary.st.try_poll_next_unpin(cx) {
-                return Poll::Ready(Some(msg));
-            }
-
             let mut conn_ready = true;
             loop {
                 match this.inner.conn.poll_ready_unpin(cx) {
@@ -495,6 +490,11 @@ where
                         break;
                     }
                 }
+            }
+
+            // first drain the primary stream
+            if let Poll::Ready(Some(msg)) = this.primary.st.try_poll_next_unpin(cx) {
+                return Poll::Ready(Some(msg));
             }
 
             // advance primary out
@@ -697,6 +697,7 @@ impl<'a> std::future::Future for ProtocolsPoller<'a> {
                     }
                     Poll::Ready(Some(Ok(msg))) => {
                         // Got a message, put protocol back and return the message
+                        self.protocols.push(proto);
                         return Poll::Ready(Some(msg));
                     }
                     Poll::Ready(None) => {
