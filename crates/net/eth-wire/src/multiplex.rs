@@ -24,7 +24,7 @@ use crate::{
     UnifiedStatus,
 };
 use bytes::{Bytes, BytesMut};
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
+use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
@@ -163,6 +163,25 @@ impl<St> RlpxProtocolMultiplexer<St> {
         let f = handshake(proxy);
         let mut f = pin!(f);
 
+        // Poll all subprotocols for new messages before entering tokio::select!
+        if !self.inner.protocols.is_empty() {
+            let mut protocols = std::mem::take(&mut self.inner.protocols);
+            for mut proto in protocols.drain(..) {
+                if let Some(Ok(msg)) = futures::StreamExt::next(&mut proto).now_or_never().flatten()
+                {
+                    self.inner.out_buffer.push_back(msg);
+                }
+                self.inner.protocols.push(proto);
+            }
+        }
+
+        // // Process any buffered messages from subprotocols
+        // while let Some(msg) = self.inner.out_buffer.pop_front() {
+        //     if let Err(err) = self.inner.conn.send(msg).await {
+        //         break;
+        //     }
+        // }
+
         loop {
             tokio::select! {
                 Some(Ok(msg)) = self.inner.conn.next() => {
@@ -197,38 +216,6 @@ impl<St> RlpxProtocolMultiplexer<St> {
                                 shared_cap,
                             }
                     }, extra))
-                }
-                // Poll existing protocols only when we have some
-                _ = async {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                }, if !self.inner.protocols.is_empty() => {
-                    // Poll all existing protocol streams for outgoing messages
-                    for idx in (0..self.inner.protocols.len()).rev() {
-                        let mut proto = self.inner.protocols.swap_remove(idx);
-                        loop {
-                            match proto.satellite_st.as_mut().poll_next(&mut std::task::Context::from_waker(futures::task::noop_waker_ref())) {
-                                Poll::Ready(Some(msg)) => {
-                                    if let Ok(masked_msg) = proto.mask_msg_id(msg) {
-                                        self.inner.out_buffer.push_back(masked_msg);
-                                    }
-                                }
-                                Poll::Ready(None) => {
-                                    // Protocol stream ended, don't put it back
-                                    break;
-                                }
-                                Poll::Pending => {
-                                    self.inner.protocols.push(proto);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Send any queued outgoing messages
-                    while let Some(msg) = self.inner.out_buffer.pop_front() {
-                        if self.inner.conn.send(msg).await.is_err() {
-                            break;
-                        }
-                    }
                 }
             }
         }
