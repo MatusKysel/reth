@@ -24,7 +24,7 @@ use crate::{
     UnifiedStatus,
 };
 use bytes::{Bytes, BytesMut};
-use futures::{FutureExt, Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
@@ -163,20 +163,14 @@ impl<St> RlpxProtocolMultiplexer<St> {
         let f = handshake(proxy);
         let mut f = pin!(f);
 
-        // Poll all subprotocols for new messages before entering tokio::select!
-        if !self.inner.protocols.is_empty() {
-            let mut protocols = std::mem::take(&mut self.inner.protocols);
-            for mut proto in protocols.drain(..) {
-                if let Some(Ok(msg)) = futures::StreamExt::next(&mut proto).now_or_never().flatten()
-                {
-                    self.inner.out_buffer.push_back(msg);
-                }
-                self.inner.protocols.push(proto);
-            }
-        }
-
         loop {
             tokio::select! {
+                // Poll all subprotocols for new messages
+                msg = ProtocolsPoller::new(&mut self.inner.protocols) => {
+                    if let Some(msg) = msg {
+                        self.inner.out_buffer.push_back(msg);
+                    }
+                }
                 Some(Ok(msg)) = self.inner.conn.next() => {
                     // Ensure the message belongs to the primary protocol
                     let Some(offset) = msg.first().copied()
@@ -675,6 +669,53 @@ impl Stream for ProtocolStream {
 impl fmt::Debug for ProtocolStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProtocolStream").field("cap", &self.shared_cap).finish_non_exhaustive()
+    }
+}
+
+/// Helper to poll multiple protocol streams in a tokio::select! branch
+struct ProtocolsPoller<'a> {
+    protocols: &'a mut Vec<ProtocolStream>,
+    current_idx: usize,
+}
+
+impl<'a> ProtocolsPoller<'a> {
+    fn new(protocols: &'a mut Vec<ProtocolStream>) -> Self {
+        Self {
+            protocols,
+            current_idx: 0,
+        }
+    }
+}
+
+impl<'a> std::future::Future for ProtocolsPoller<'a> {
+    type Output = Option<Bytes>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            if self.current_idx >= self.protocols.len() {
+                self.current_idx = 0;
+                return Poll::Pending;
+            }
+
+            let current_idx = self.current_idx;
+            let proto = &mut self.protocols[current_idx];
+            match proto.satellite_st.as_mut().poll_next(cx) {
+                Poll::Ready(Some(msg)) => {
+                    if let Ok(masked_msg) = proto.mask_msg_id(msg) {
+                        return Poll::Ready(Some(masked_msg));
+                    }
+                    // Continue polling this protocol if masking failed
+                }
+                Poll::Ready(None) => {
+                    // Protocol ended, remove it
+                    self.protocols.remove(current_idx);
+                    // Don't increment current_idx since we removed an element
+                }
+                Poll::Pending => {
+                    self.current_idx += 1;
+                }
+            }
+        }
     }
 }
 
