@@ -19,7 +19,9 @@ use std::{
 use crate::{
     capability::{SharedCapabilities, SharedCapability, UnsupportedCapabilityError},
     errors::{EthStreamError, P2PStreamError},
+    handshake::EthRlpxHandshake,
     p2pstream::DisconnectP2P,
+    p2pstream::HANDSHAKE_TIMEOUT,
     CanDisconnect, Capability, DisconnectReason, EthStream, P2PStream, UnauthedEthStream,
     UnifiedStatus,
 };
@@ -27,6 +29,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStream, TryStreamExt};
 use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
+use std::sync::Arc;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, info, warn};
@@ -237,6 +240,7 @@ impl<St> RlpxProtocolMultiplexer<St> {
         self,
         status: UnifiedStatus,
         fork_filter: ForkFilter,
+        handshake: Arc<dyn EthRlpxHandshake>,
     ) -> Result<(RlpxSatelliteStream<St, EthStream<ProtocolProxy, N>>, UnifiedStatus), EthStreamError>
     where
         St: Stream<Item = io::Result<BytesMut>> + Sink<Bytes, Error = io::Error> + Unpin,
@@ -244,8 +248,17 @@ impl<St> RlpxProtocolMultiplexer<St> {
         let eth_cap = self.inner.conn.shared_capabilities().eth_version()?;
         self.into_satellite_stream_with_tuple_handshake(
             &Capability::eth(eth_cap),
-            move |proxy| async move {
-                UnauthedEthStream::new(proxy).handshake(status, fork_filter).await
+            move |proxy| {
+                let handshake = handshake.clone();
+                async move {
+                    let mut unauth = ProxyUnauth { inner: proxy };
+                    let their_status =
+                        handshake
+                            .handshake(&mut unauth, status, fork_filter, HANDSHAKE_TIMEOUT)
+                            .await?;
+                    let eth_stream = EthStream::new(eth_cap, unauth.into_inner());
+                    Ok((eth_stream, their_status))
+                }
             },
         )
         .await
@@ -407,6 +420,57 @@ impl CanDisconnect<Bytes> for ProtocolProxy {
     ) -> Pin<Box<dyn Future<Output = Result<(), <Self as Sink<Bytes>>::Error>> + Send + '_>> {
         // TODO handle disconnects
         Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Adapter so the injected `EthRlpxHandshake` can run over a multiplexed `ProtocolProxy`
+/// using the same error type expectations (`P2PStreamError`).
+#[derive(Debug)]
+struct ProxyUnauth {
+    inner: ProtocolProxy,
+}
+
+impl ProxyUnauth {
+    fn into_inner(self) -> ProtocolProxy { self.inner }
+}
+
+impl Stream for ProxyUnauth {
+    type Item = Result<BytesMut, P2PStreamError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map(|opt| opt.map(|res| res.map_err(P2PStreamError::from)))
+    }
+}
+
+impl Sink<Bytes> for ProxyUnauth {
+    type Error = P2PStreamError;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_ready(cx).map_err(P2PStreamError::from)
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        Pin::new(&mut self.inner).start_send(item).map_err(P2PStreamError::from)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx).map_err(P2PStreamError::from)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.inner).poll_close(cx).map_err(P2PStreamError::from)
+    }
+}
+
+impl CanDisconnect<Bytes> for ProxyUnauth {
+    fn disconnect(
+        &mut self,
+        reason: DisconnectReason,
+    ) -> Pin<Box<dyn Future<Output = Result<(), <Self as Sink<Bytes>>::Error>> + Send + '_>> {
+        let fut = self.inner.disconnect(reason);
+        Box::pin(async move { fut.await.map_err(P2PStreamError::from) })
     }
 }
 
@@ -772,6 +836,8 @@ mod tests {
         },
         UnauthedP2PStream,
     };
+    use crate::handshake::EthHandshake;
+    use std::sync::Arc;
     use reth_eth_wire_types::EthNetworkPrimitives;
     use tokio::{net::TcpListener, sync::oneshot};
     use tokio_util::codec::Decoder;
@@ -832,7 +898,11 @@ mod tests {
             let (conn, _) = UnauthedP2PStream::new(stream).handshake(server_hello).await.unwrap();
 
             let (mut st, _their_status) = RlpxProtocolMultiplexer::new(conn)
-                .into_eth_satellite_stream::<EthNetworkPrimitives>(other_status, other_fork_filter)
+                .into_eth_satellite_stream::<EthNetworkPrimitives>(
+                    other_status,
+                    other_fork_filter,
+                    Arc::new(EthHandshake::default()),
+                )
                 .await
                 .unwrap();
 
@@ -863,7 +933,11 @@ mod tests {
 
         let conn = connect_passthrough(local_addr, test_hello().0).await;
         let (mut st, _their_status) = RlpxProtocolMultiplexer::new(conn)
-            .into_eth_satellite_stream::<EthNetworkPrimitives>(status, fork_filter)
+            .into_eth_satellite_stream::<EthNetworkPrimitives>(
+                status,
+                fork_filter,
+                Arc::new(EthHandshake::default()),
+            )
             .await
             .unwrap();
 
