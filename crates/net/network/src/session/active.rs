@@ -41,7 +41,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
-use tracing::{debug, trace};
+use tracing::{debug, trace, info, warn, error};
 
 /// The recommended interval at which a new range update should be sent to the remote peer.
 ///
@@ -158,12 +158,14 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
     ///
     /// Returns an error if the message is considered to be in violation of the protocol.
     fn on_incoming_message(&mut self, msg: EthMessage<N>) -> OnIncomingMessageOutcome<N> {
+        info!("Processing incoming message: {:?} from peer {:?}", msg.message_id(), self.remote_peer_id);
         /// A macro that handles an incoming request
         /// This creates a new channel and tries to send the sender half to the session while
         /// storing the receiver half internally so the pending response can be polled.
         macro_rules! on_request {
             ($req:ident, $resp_item:ident, $req_item:ident) => {{
                 let RequestPair { request_id, message: request } = $req;
+                info!("Received request {} from peer {:?}: {:?}", request_id, self.remote_peer_id, stringify!($req_item));
                 let (tx, response) = oneshot::channel();
                 let received = ReceivedRequest {
                     request_id,
@@ -183,24 +185,25 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
         macro_rules! on_response {
             ($resp:ident, $item:ident) => {{
                 let RequestPair { request_id, message } = $resp;
+                info!("Received response {} from peer {:?}: {:?}", request_id, self.remote_peer_id, stringify!($item));
                 if let Some(req) = self.inflight_requests.remove(&request_id) {
                     match req.request {
                         RequestState::Waiting(PeerRequest::$item { response, .. }) => {
-                            trace!(peer_id=?self.remote_peer_id, ?request_id, "received response from peer");
+                            info!("Matching request found for response {}, sending to handler", request_id);
                             let _ = response.send(Ok(message));
                             self.update_request_timeout(req.timestamp, Instant::now());
                         }
                         RequestState::Waiting(request) => {
+                            warn!("Response {} received for different request type, sending bad response", request_id);
                             request.send_bad_response();
                         }
                         RequestState::TimedOut => {
-                            // request was already timed out internally
+                            info!("Response {} received for already timed out request", request_id);
                             self.update_request_timeout(req.timestamp, Instant::now());
                         }
                     }
                 } else {
-                    trace!(peer_id=?self.remote_peer_id, ?request_id, "received response to unknown request");
-                    // we received a response to a request we never sent
+                    warn!("Received response {} to unknown request from peer {:?}", request_id, self.remote_peer_id);
                     self.on_bad_message();
                 }
 
@@ -209,28 +212,39 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
         }
 
         match msg {
-            message @ EthMessage::Status(_) => OnIncomingMessageOutcome::BadMessage {
-                error: EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake),
-                message,
+            message @ EthMessage::Status(_) => {
+                error!("Received Status message outside handshake from peer {:?}", self.remote_peer_id);
+                OnIncomingMessageOutcome::BadMessage {
+                    error: EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake),
+                    message,
+                }
             },
             EthMessage::NewBlockHashes(msg) => {
+                info!("Received NewBlockHashes with {} hashes from peer {:?}", msg.0.len(), self.remote_peer_id);
                 self.try_emit_broadcast(PeerMessage::NewBlockHashes(msg)).into()
             }
             EthMessage::NewBlock(msg) => {
+                let block_hash = msg.block().header().hash_slow();
+                info!("Received NewBlock {} from peer {:?}", block_hash, self.remote_peer_id);
                 let block = NewBlockMessage {
-                    hash: msg.block().header().hash_slow(),
+                    hash: block_hash,
                     block: Arc::new(*msg),
                 };
                 self.try_emit_broadcast(PeerMessage::NewBlock(block)).into()
             }
             EthMessage::Transactions(msg) => {
+                info!("Received {} transactions from peer {:?}", msg.0.len(), self.remote_peer_id);
                 self.try_emit_broadcast(PeerMessage::ReceivedTransaction(msg)).into()
             }
             EthMessage::NewPooledTransactionHashes66(msg) => {
+                info!("Received NewPooledTransactionHashes66 with {} hashes from peer {:?}", msg.0.len(), self.remote_peer_id);
                 self.try_emit_broadcast(PeerMessage::PooledTransactions(msg.into())).into()
             }
             EthMessage::NewPooledTransactionHashes68(msg) => {
+                info!("Received NewPooledTransactionHashes68 with {} hashes from peer {:?}", msg.hashes.len(), self.remote_peer_id);
                 if msg.hashes.len() != msg.types.len() || msg.hashes.len() != msg.sizes.len() {
+                    error!("Invalid NewPooledTransactionHashes68 field lengths from peer {:?}: hashes={}, types={}, sizes={}", 
+                           self.remote_peer_id, msg.hashes.len(), msg.types.len(), msg.sizes.len());
                     return OnIncomingMessageOutcome::BadMessage {
                         error: EthStreamError::TransactionHashesInvalidLenOfFields {
                             hashes_len: msg.hashes.len(),
@@ -307,7 +321,7 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
     fn on_internal_peer_request(&mut self, request: PeerRequest<N>, deadline: Instant) {
         let request_id = self.next_id();
 
-        trace!(?request, peer_id=?self.remote_peer_id, ?request_id, "sending request to peer");
+        info!("Sending request {} to peer {:?}: {:?}", request_id, self.remote_peer_id, std::any::type_name::<PeerRequest<N>>());
         let msg = request.create_request_message(request_id);
         self.queued_outgoing.push_back(msg.into());
         let req = InflightRequest {
@@ -320,32 +334,41 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
 
     /// Handle a message received from the internal network
     fn on_internal_peer_message(&mut self, msg: PeerMessage<N>) {
+        info!("Handling internal message for peer {:?}: {:?}", self.remote_peer_id, std::any::type_name::<PeerMessage<N>>());
         match msg {
             PeerMessage::NewBlockHashes(msg) => {
+                info!("Queuing NewBlockHashes with {} hashes to peer {:?}", msg.0.len(), self.remote_peer_id);
                 self.queued_outgoing.push_back(EthMessage::NewBlockHashes(msg).into());
             }
             PeerMessage::NewBlock(msg) => {
+                info!("Queuing NewBlock {} to peer {:?}", msg.hash, self.remote_peer_id);
                 self.queued_outgoing.push_back(EthBroadcastMessage::NewBlock(msg.block).into());
             }
             PeerMessage::PooledTransactions(msg) => {
                 if msg.is_valid_for_version(self.conn.version()) {
+                    info!("Queuing PooledTransactions to peer {:?} (version {:?})", self.remote_peer_id, self.conn.version());
                     self.queued_outgoing.push_back(EthMessage::from(msg).into());
                 } else {
-                    debug!(target: "net", ?msg,  version=?self.conn.version(), "Message is invalid for connection version, skipping");
+                    warn!("Skipping PooledTransactions message invalid for connection version {:?} to peer {:?}", self.conn.version(), self.remote_peer_id);
                 }
             }
             PeerMessage::EthRequest(req) => {
+                info!("Processing internal EthRequest for peer {:?}", self.remote_peer_id);
                 let deadline = self.request_deadline();
                 self.on_internal_peer_request(req, deadline);
             }
             PeerMessage::SendTransactions(msg) => {
+                info!("Queuing {} transactions to peer {:?}", msg.0.len(), self.remote_peer_id);
                 self.queued_outgoing.push_back(EthBroadcastMessage::Transactions(msg).into());
             }
-            PeerMessage::BlockRangeUpdated(_) => {}
+            PeerMessage::BlockRangeUpdated(_) => {
+                info!("Received BlockRangeUpdated for peer {:?}", self.remote_peer_id);
+            }
             PeerMessage::ReceivedTransaction(_) => {
                 unreachable!("Not emitted by network")
             }
             PeerMessage::Other(other) => {
+                info!("Queuing raw capability message to peer {:?}", self.remote_peer_id);
                 self.queued_outgoing.push_back(OutgoingMessage::Raw(other));
             }
         }
@@ -457,6 +480,7 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
 
     /// Starts the disconnect process
     fn start_disconnect(&mut self, reason: DisconnectReason) -> Result<(), EthStreamError> {
+        info!("Starting disconnect for peer {:?} with reason: {:?}", self.remote_peer_id, reason);
         Ok(self.conn.inner_mut().start_disconnect(reason)?)
     }
 

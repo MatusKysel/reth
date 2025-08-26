@@ -29,6 +29,7 @@ use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::{info, warn, error};
 
 /// A Stream and Sink type that wraps a raw rlpx stream [`P2PStream`] and handles message ID
 /// multiplexing.
@@ -40,6 +41,7 @@ pub struct RlpxProtocolMultiplexer<St> {
 impl<St> RlpxProtocolMultiplexer<St> {
     /// Wraps the raw p2p stream
     pub fn new(conn: P2PStream<St>) -> Self {
+        info!("Creating new RlpxProtocolMultiplexer with shared capabilities: {:?}", conn.shared_capabilities());
         Self {
             inner: MultiplexInner {
                 conn,
@@ -62,7 +64,13 @@ impl<St> RlpxProtocolMultiplexer<St> {
         F: FnOnce(ProtocolConnection) -> Proto,
         Proto: Stream<Item = BytesMut> + Send + 'static,
     {
-        self.inner.install_protocol(cap, f)
+        info!("Installing protocol: {:?}", cap);
+        let result = self.inner.install_protocol(cap, f);
+        match &result {
+            Ok(()) => info!("Successfully installed protocol: {:?}", cap),
+            Err(e) => warn!("Failed to install protocol {:?}: {:?}", cap, e),
+        }
+        result
     }
 
     /// Returns the [`SharedCapabilities`] of the underlying raw p2p stream
@@ -79,11 +87,14 @@ impl<St> RlpxProtocolMultiplexer<St> {
     where
         F: FnOnce(ProtocolProxy) -> Primary,
     {
+        info!("Converting to satellite stream for capability: {:?}", cap);
         let Ok(shared_cap) = self.shared_capabilities().ensure_matching_capability(cap).cloned()
         else {
+            warn!("Capability not shared: {:?}", cap);
             return Err(P2PStreamError::CapabilityNotShared);
         };
 
+        info!("Creating protocol proxy for shared capability: {:?}", shared_cap);
         let (to_primary, from_wire) = mpsc::unbounded_channel();
         let (to_wire, from_primary) = mpsc::unbounded_channel();
         let proxy = ProtocolProxy {
@@ -93,6 +104,7 @@ impl<St> RlpxProtocolMultiplexer<St> {
         };
 
         let st = primary(proxy);
+        info!("Successfully created satellite stream for capability: {:?}", shared_cap);
         Ok(RlpxSatelliteStream {
             inner: self.inner,
             primary: PrimaryProtocol {
@@ -168,32 +180,40 @@ impl<St> RlpxProtocolMultiplexer<St> {
                 // Poll all subprotocols for new messages
                 msg = ProtocolsPoller::new(&mut self.inner.protocols) => {
                     if let Some(msg) = msg {
+                        info!("Satellite protocol sent outgoing message: {} bytes", msg.len());
                         self.inner.out_buffer.push_back(msg);
                     }
                 }
                 Some(Ok(msg)) = self.inner.conn.next() => {
+                    info!("Received message during handshake: {} bytes", msg.len());
                     // Ensure the message belongs to the primary protocol
                     let Some(offset) = msg.first().copied()
                     else {
+                        error!("Received empty protocol message during handshake");
                         return Err(P2PStreamError::EmptyProtocolMessage.into())
                     };
                     if let Some(cap) = self.shared_capabilities().find_by_relative_offset(offset).cloned() {
                             if cap == shared_cap {
                                 // delegate to primary
+                                info!("Delegating message to primary protocol: {:?}", cap);
                                 let _ = to_primary.send(msg);
                             } else {
                                 // delegate to satellite
+                                info!("Delegating message to satellite protocol: {:?}", cap);
                                 self.inner.delegate_message(&cap, msg);
                             }
                         } else {
+                           error!("Unknown reserved message ID during handshake: {}", offset);
                            return Err(P2PStreamError::UnknownReservedMessageId(offset).into())
                         }
                 }
                 Some(msg) = from_primary.recv() => {
+                    info!("Primary protocol sending message: {} bytes", msg.len());
                     self.inner.conn.send(msg).await.map_err(Into::into)?;
                 }
                 res = &mut f => {
                     let (st, extra) = res?;
+                    info!("Handshake completed successfully");
                     return Ok((RlpxSatelliteStream {
                             inner: self.inner,
                             primary: PrimaryProtocol {
@@ -248,10 +268,12 @@ impl<St> MultiplexInner<St> {
     fn delegate_message(&self, cap: &SharedCapability, msg: BytesMut) -> bool {
         for proto in &self.protocols {
             if proto.shared_cap == *cap {
+                info!("Delegating message to protocol {:?}: {} bytes", cap, msg.len());
                 proto.send_raw(msg);
                 return true;
             }
         }
+        warn!("No matching protocol found for capability: {:?}", cap);
         false
     }
 
@@ -304,9 +326,10 @@ impl ProtocolProxy {
     /// Sends a _non-empty_ message on the wire.
     fn try_send(&self, msg: Bytes) -> Result<(), io::Error> {
         if msg.is_empty() {
-            // message must not be empty
+            warn!("Attempted to send empty message");
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        info!("ProtocolProxy sending message: {} bytes", msg.len());
         self.to_wire.send(self.mask_msg_id(msg)?).map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
 
@@ -347,7 +370,10 @@ impl Stream for ProtocolProxy {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let msg = ready!(self.from_wire.poll_next_unpin(cx));
-        Poll::Ready(msg.map(|msg| self.get_mut().unmask_id(msg)))
+        Poll::Ready(msg.map(|msg| {
+            info!("ProtocolProxy received message: {} bytes", msg.len());
+            self.get_mut().unmask_id(msg)
+        }))
     }
 }
 
@@ -537,25 +563,36 @@ where
                 match this.inner.conn.poll_next_unpin(cx) {
                     Poll::Ready(Some(Ok(msg))) => {
                         delegated = true;
+                        info!("Received message from connection: {} bytes", msg.len());
                         let Some(offset) = msg.first().copied() else {
+                            error!("Received empty protocol message");
                             return Poll::Ready(Some(Err(
                                 P2PStreamError::EmptyProtocolMessage.into()
                             )));
                         };
+                        info!("Message offset: {}", offset);
                         // delegate the multiplexed message to the correct protocol
                         if let Some(cap) =
                             this.inner.conn.shared_capabilities().find_by_relative_offset(offset)
                         {
                             if cap == &this.primary.shared_cap {
                                 // delegate to primary
+                                info!("Delegating message to primary protocol: {:?}, {} bytes", cap, msg.len());
                                 let _ = this.primary.to_primary.send(msg);
                             } else {
                                 // delegate to installed satellite if any
+                                info!("Searching satellite protocols for capability: {:?}", cap);
+                                let mut delegated = false;
                                 for proto in &this.inner.protocols {
                                     if proto.shared_cap == *cap {
+                                        info!("Delegating message to satellite protocol: {:?}, {} bytes", cap, msg.len());
                                         proto.send_raw(msg);
+                                        delegated = true;
                                         break;
                                     }
+                                }
+                                if !delegated {
+                                    warn!("No satellite protocol found for capability: {:?}", cap);
                                 }
                             }
                         } else {
