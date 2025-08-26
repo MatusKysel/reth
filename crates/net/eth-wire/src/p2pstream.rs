@@ -572,11 +572,24 @@ where
 
         // poll the pinger to determine if we should send a ping
         match this.pinger.poll_ping(cx) {
-            Poll::Pending => {}
+            Poll::Pending => {
+                // Uncomment the line below to see frequent pinger polling (very verbose)
+                // info!("Pinger poll returned Pending");
+            }
             Poll::Ready(Ok(PingerEvent::Ping)) => {
+                info!("Pinger requested ping, sending ping message");
                 this.send_ping();
             }
-            _ => {
+            Poll::Ready(Err(err)) => {
+                error!("Pinger error: {:?}, starting disconnect due to ping timeout", err);
+                // encode the disconnect message
+                this.start_disconnect(DisconnectReason::PingTimeout)?;
+
+                // End the stream after ping related error
+                return Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(other)) => {
+                warn!("Pinger returned unexpected event: {:?}, starting disconnect", other);
                 // encode the disconnect message
                 this.start_disconnect(DisconnectReason::PingTimeout)?;
 
