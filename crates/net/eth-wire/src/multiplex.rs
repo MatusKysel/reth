@@ -29,7 +29,7 @@ use reth_eth_wire_types::NetworkPrimitives;
 use reth_ethereum_forks::ForkFilter;
 use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 /// A Stream and Sink type that wraps a raw rlpx stream [`P2PStream`] and handles message ID
 /// multiplexing.
@@ -41,7 +41,10 @@ pub struct RlpxProtocolMultiplexer<St> {
 impl<St> RlpxProtocolMultiplexer<St> {
     /// Wraps the raw p2p stream
     pub fn new(conn: P2PStream<St>) -> Self {
-        info!("Creating new RlpxProtocolMultiplexer with shared capabilities: {:?}", conn.shared_capabilities());
+        info!(
+            "Creating new RlpxProtocolMultiplexer with shared capabilities: {:?}",
+            conn.shared_capabilities()
+        );
         Self {
             inner: MultiplexInner {
                 conn,
@@ -181,7 +184,7 @@ impl<St> RlpxProtocolMultiplexer<St> {
                 msg = ProtocolsPoller::new(&mut self.inner.protocols) => {
                     if let Some(msg) = msg {
                         info!("Satellite protocol sent outgoing message: {} bytes", msg.len());
-                        self.inner.out_buffer.push_back(msg);
+                        self.inner.conn.send(msg).await.map_err(Into::into)?; // Direct send like primary
                     }
                 }
                 Some(Ok(msg)) = self.inner.conn.next() => {
@@ -577,7 +580,11 @@ where
                         {
                             if cap == &this.primary.shared_cap {
                                 // delegate to primary
-                                info!("Delegating message to primary protocol: {:?}, {} bytes", cap, msg.len());
+                                info!(
+                                    "Delegating message to primary protocol: {:?}, {} bytes",
+                                    cap,
+                                    msg.len()
+                                );
                                 let _ = this.primary.to_primary.send(msg);
                             } else {
                                 // delegate to installed satellite if any
